@@ -1,0 +1,27 @@
+.crucible-reaction-prompt {
+  border: 1px solid var(--color-border-highlight, #782e22);
+  border-radius: 4px;
+  padding: 6px 8px;
+  background: rgba(120, 46, 34, 0.08);
+}
+
+.crucible-reaction-prompt .reaction-flavor {
+  margin: 0 0 6px 0;
+}
+
+.crucible-reaction-prompt .reaction-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.crucible-reaction-prompt .reaction-buttons button {
+  flex: 1;
+  line-height: 1.6;
+}
+
+.crucible-reaction-prompt .reaction-resolved {
+  margin: 0;
+  font-style: italic;
+  opacity: 0.8;
+  text-align: center;
+}

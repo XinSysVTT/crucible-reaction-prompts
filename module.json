@@ -1,0 +1,35 @@
+{
+  "id": "crucible-reaction-prompts",
+  "title": "Crucible Reaction Prompts",
+  "description": "Watches combat for moments when a character could use a reaction (e.g. Reactive Strike when an enemy leaves engagement, Counterspell when an enemy casts a spell, or Counter-Riposte/Counter-Strike/Counter-Evade/Defensive Roll/Repercussive Block right after a successful melee defense) and posts a chat card to that character's owner(s) and the GM with a one-click 'Use it?' button. Built to be extended: register additional actions against the same triggers, or add new trigger types, via game.modules.get('crucible-reaction-prompts').api.",
+  "version": "0.0.1",
+  "compatibility": {
+    "minimum": 14,
+    "verified": 14
+  },
+  "relationships": {
+    "systems": [
+      {
+        "id": "crucible",
+        "type": "system",
+        "compatibility": {
+          "minimum": "0.10.1"
+        }
+      }
+    ]
+  },
+  "esmodules": [
+    "scripts/reaction-prompts.mjs"
+  ],
+  "styles": [
+    "styles/reaction-prompts.css"
+  ],
+  "authors": [
+    {
+      "name": "Custom"
+    }
+  ],
+  "url": "",
+  "manifest": "",
+  "download": ""
+}
