@@ -37,6 +37,12 @@
 const MODULE_ID = "crucible-reaction-prompts";
 const FLAG_SCOPE = MODULE_ID;
 
+/** Toggle verbose console logging while troubleshooting a trigger that "should" have fired but didn't. */
+const DEBUG = true;
+function log(...args) {
+  if (DEBUG) console.debug(`${MODULE_ID} |`, ...args);
+}
+
 /* -------------------------------------------- */
 /*  Trigger Registry                             */
 /* -------------------------------------------- */
@@ -156,22 +162,24 @@ Hooks.on("deleteCombat", () => lastEngagement.clear());
 Hooks.on("createChatMessage", message => {
   if (game.system.id !== "crucible") return;
   if (!isAuthoritativeClient()) return;
-  if (!game.combat?.started) return;
+  if (!game.combat?.started) return log("skipped message - no combat is currently started", message.id);
 
   const flags = message.flags?.crucible;
-  if (!flags?.action) return;
+  if (!flags?.action) return; // Most messages aren't a CrucibleAction at all - not worth logging.
 
   let action;
   try {
     action = crucible.api.models.CrucibleAction.fromChatMessage(message);
   } catch (err) {
-    return; // Not a reconstructable action message.
+    return log("could not reconstruct CrucibleAction from message", message.id, err);
   }
-  if (!action) return;
+  if (!action) return log("fromChatMessage returned no action for message", message.id);
 
   const actingToken = fromUuidSync(flags.actor)?.token?.object
     ?? canvas.tokens?.placeables.find(t => t.actor?.uuid === flags.actor);
-  if (!actingToken) return;
+  if (!actingToken) return log("could not resolve an acting token for actor", flags.actor);
+
+  log("reconstructed action", action.id, "tags:", [...(action.tags ?? [])], "for actor", actingToken.actor?.name);
 
   const wasSpell = action.tags?.has("composed") || action.tags?.has("iconicSpell");
   if (wasSpell) checkSpellCast(action, actingToken);
@@ -187,10 +195,15 @@ Hooks.on("createChatMessage", message => {
  * @param {Token} casterToken
  */
 function checkSpellCast(action, casterToken) {
-  for (const combatant of (game.combat?.combatants ?? [])) {
+  const combatants = [...(game.combat?.combatants ?? [])];
+  log("spell cast detected, checking", combatants.length, "combatants for a Counterspell opportunity");
+  for (const combatant of combatants) {
     const reactorToken = combatant.token?.object;
     if (!reactorToken || (reactorToken === casterToken) || !reactorToken.actor) continue;
-    if (!areEnemies(reactorToken, casterToken)) continue;
+    if (!areEnemies(reactorToken, casterToken)) {
+      log(reactorToken.actor?.name, "is not hostile to the caster - skipping");
+      continue;
+    }
     evaluateActorReactions(reactorToken, "spellCast", casterToken);
   }
 }
@@ -234,41 +247,35 @@ async function evaluateActorReactions(reactorToken, triggerType, targetToken) {
     if (registeredTrigger !== triggerType) continue;
 
     const action = actor.actions?.[actionId];
-    if (!action) continue; // This actor doesn't have that action at all.
+    if (!action) continue; // This actor doesn't have that action at all - not worth logging, most won't.
 
     const key = `${reactorToken.id}:${targetToken.id}:${actionId}`;
     const now = Date.now();
     const last = recentPrompts.get(key);
-    if (last && ((now - last) < RECENT_PROMPT_WINDOW_MS)) continue;
+    if (last && ((now - last) < RECENT_PROMPT_WINDOW_MS)) {
+      log(actor.name, actionId, "skipped - already prompted for this within the debounce window");
+      continue;
+    }
     recentPrompts.set(key, now);
 
-    if (!actorLooksEligible(action)) continue;
-    if (!isTargetInRange(action, reactorToken, targetToken)) continue;
-    await postReactionPrompt({actor, reactorToken, action, targetToken, triggerType});
-  }
-}
+    let eligibilityError = null;
+    try {
+      action._canUse();
+    } catch (err) {
+      eligibilityError = err;
+    }
+    if (eligibilityError) {
+      log(actor.name, actionId, "not eligible right now:", eligibilityError.message ?? eligibilityError);
+      continue;
+    }
 
-/**
- * A best-effort, side-effect-free check for whether an Action is currently worth prompting about:
- * does the actor still have enough Action Points / Focus / whatever else the action costs, AND does it
- * pass the "reaction" tag's own gates (in combat, not currently their turn, not Unaware, has the
- * required ability score)? This calls the same _canUse() pre-check the system itself runs right before
- * it would open the action's configuration dialog, so it stays correct even if a talent changes an
- * action's cost dynamically (e.g. a talent that trades Action for Focus).
- *
- * Target-specific nuances that _canUse() can't see yet (e.g. a Champion's Dominance bypass, or
- * Counterspell's "must still be the last action" rule) are left to the real CrucibleAction#use()
- * workflow to enforce when the button is actually clicked - a prompt that turns out to be stale just
- * shows the system's normal warning instead of silently doing something wrong.
- * @param {object} action  A prepared CrucibleAction instance (actor.actions[id]).
- * @returns {boolean}
- */
-function actorLooksEligible(action) {
-  try {
-    action._canUse();
-    return true;
-  } catch (err) {
-    return false;
+    if (!isTargetInRange(action, reactorToken, targetToken)) {
+      log(actor.name, actionId, "target", targetToken.actor?.name, "is out of range - no prompt");
+      continue;
+    }
+
+    log(actor.name, "can use", actionId, "against", targetToken.actor?.name, "- posting prompt");
+    await postReactionPrompt({actor, reactorToken, action, targetToken, triggerType});
   }
 }
 
@@ -319,6 +326,17 @@ function isAuthoritativeClient() {
   return game.users.activeGM?.isSelf ?? false;
 }
 
+/**
+ * Minimal HTML-escaping for names interpolated into chat card content.
+ * @param {string} text
+ * @returns {string}
+ */
+function escapeHTML(text) {
+  return String(text ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+
 /* -------------------------------------------- */
 /*  Chat Card                                    */
 /* -------------------------------------------- */
@@ -337,21 +355,33 @@ async function postReactionPrompt({actor, reactorToken, action, targetToken, tri
   if (!whisper.length) return;
 
   const triggerLabel = TRIGGER_TYPES.get(triggerType)?.label ?? triggerType;
+  // Reuses Crucible's own "action line-item" / "action-header" markup and classes (see
+  // templates/dice/partials/action-use-header.hbs) so the prompt sits visually alongside the rest of the
+  // combat log instead of looking like a bolted-on widget. The outer chat-message <li> already gets the
+  // "crucible" class from CrucibleChatMessage's own render hook, which is what the system's chat.less
+  // rules key off of - nothing extra is needed here to inherit that styling.
   const content = `
     <div class="crucible-reaction-prompt" data-action-id="${action.id}"
          data-reactor-uuid="${actor.uuid}" data-target-uuid="${targetToken.actor.uuid}">
-      <p class="reaction-flavor">
-        <strong>${actor.name}</strong> could use <strong>${action.name}</strong>
-        because ${triggerLabel} (<strong>${targetToken.actor.name}</strong>).
-      </p>
-      <div class="reaction-buttons">
-        <button type="button" class="reaction-use">
-          <i class="fa-solid fa-bolt"></i> Use ${action.name}
-        </button>
-        <button type="button" class="reaction-dismiss">
-          <i class="fa-solid fa-xmark"></i> Not now
-        </button>
-      </div>
+      <section class="action line-item">
+        <header class="action-header">
+          <div class="title">
+            <h4>${escapeHTML(action.name)}</h4>
+          </div>
+        </header>
+        <p class="reaction-flavor">
+          <strong>${escapeHTML(actor.name)}</strong> could use <strong>${escapeHTML(action.name)}</strong>
+          because ${triggerLabel} (<strong>${escapeHTML(targetToken.actor.name)}</strong>).
+        </p>
+        <div class="reaction-buttons">
+          <button type="button" class="reaction-use frame-brown">
+            <i class="fa-solid fa-bolt"></i> Use ${escapeHTML(action.name)}
+          </button>
+          <button type="button" class="reaction-dismiss frame-brown">
+            <i class="fa-solid fa-xmark"></i> Not now
+          </button>
+        </div>
+      </section>
     </div>`.trim();
 
   await ChatMessage.create({
@@ -391,6 +421,14 @@ Hooks.on("renderChatMessageHTML", (message, html) => {
   const prompt = root?.querySelector?.(".crucible-reaction-prompt");
   if (!prompt) return;
 
+  // CrucibleChatMessage#onRenderHTML only adds its "crucible"/"themed theme-dark" card classes when
+  // message.flags.crucible is non-empty. Our prompt intentionally stores its own state under a separate
+  // flag scope (crucible-reaction-prompts) rather than faking flags.crucible.action - faking that could
+  // trip auto-confirm, VFX replay, or the Confirm/Reverse context menu, none of which make sense for a
+  // prompt that isn't itself a used action. So apply the same two classes by hand instead.
+  root.classList.add("crucible");
+  root.querySelector(".message-content")?.classList.add("themed", "theme-dark");
+
   prompt.querySelector(".reaction-use")?.addEventListener("click", () => onUseReaction(message, prompt));
   prompt.querySelector(".reaction-dismiss")?.addEventListener("click", () => onDismissReaction(message, prompt));
 
@@ -414,15 +452,24 @@ async function onUseReaction(message, promptEl) {
     return ui.notifications.warn("You don't have permission to act for this character.");
   }
 
-  const action = actor.actions?.[actionId];
-  if (!action) return ui.notifications.warn(`${actor.name} no longer has that action available.`);
+  if (!actor.actions?.[actionId]) return ui.notifications.warn(`${actor.name} no longer has that action available.`);
 
   // Target the token whose event triggered this prompt, so the action's own targeting logic just works.
   const targetActor = fromUuidSync(targetUuid);
   const targetToken = targetActor?.getActiveTokens()[0];
   if (targetToken) targetToken.setTarget(true, {releaseOthers: true, user: game.user});
 
-  const result = await action.use({dialog: true});
+  // actor.useAction() is the same public entry point the character sheet itself calls (see
+  // base-actor-sheet.mjs) - it resolves the correct token and calls the real CrucibleAction#use()
+  // workflow, so the resulting chat message is a completely normal, revertible Crucible action card
+  // (Confirm/Reverse show up automatically via right-click, driven by the message's own flags).
+  let result;
+  try {
+    result = await actor.useAction(actionId);
+  } catch (err) {
+    console.error(`${MODULE_ID} |`, err);
+    return ui.notifications.warn(err.message ?? `${actor.name} could not use ${actionId} right now.`);
+  }
   await resolveMessage(message, promptEl, result ? "used" : "cancelled");
 }
 

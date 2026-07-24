@@ -18,10 +18,33 @@ gets a whispered chat card:
 > leaves engagement (**Goblin Skirmisher**).
 > `[Use Reactive Strike]` `[Not now]`
 
-Clicking **Use** targets the right token automatically and calls the action's
-normal `use()` workflow — so the game's own targeting, cost, and eligibility
-rules still get the final say. This module only decides *who to nudge*, not
-*whether the rule allows it*.
+Clicking **Use** targets the right token automatically and calls
+`actor.useAction(actionId)` — the exact same public entry point the
+character sheet itself uses — so the resulting chat card is a completely
+normal, revertible Crucible action message (right-click it for the system's
+own Confirm/Reverse options, same as any other action), and the prompt
+card itself reuses Crucible's own `action`/`action-header` chat-card markup
+(minus the action icon image, which isn't needed for a short prompt) and
+its `frame-brown` framed-button style (the same class the system's own
+"Confirm" chat button uses) so it sits visually consistent with the rest of
+the combat log. Note: Crucible's
+own dark-theme card classes (`crucible`, `themed theme-dark`) are normally
+added by the system's own render hook, but only when a message's
+`flags.crucible` data is non-empty - since this module deliberately keeps
+its own state under a separate flag scope (to avoid tripping the real
+action pipeline's auto-confirm/VFX/Reverse logic on a message that isn't
+really an action), it applies those same two classes itself instead.
+
+## Troubleshooting
+
+The module logs every trigger evaluation to the console at `debug` level
+(prefixed `crucible-reaction-prompts |`). If a reaction you expected didn't
+prompt, open the browser console (F12) on the **active GM's** client (only
+that client evaluates triggers — see "How it works" below) and look for a
+line naming the actor/action, which will say either that a prompt was
+posted or exactly why one wasn't (not eligible, out of range, not hostile,
+already prompted recently, etc.). Set `DEBUG = false` at the top of
+`scripts/reaction-prompts.mjs` to quiet this once you're done troubleshooting.
 
 ## Install
 

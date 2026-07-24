@@ -1,26 +1,27 @@
-.crucible-reaction-prompt {
-  border: 1px solid var(--color-border-highlight, #782e22);
-  border-radius: 4px;
-  padding: 6px 8px;
-  background: rgba(120, 46, 34, 0.08);
-}
+/* Structural styling (icon, header, spacing) is inherited from Crucible's own
+   ".crucible .action .action-header" chat-card rules - this file only covers the
+   bits that are unique to a reaction prompt (the flavor line and button row). */
 
 .crucible-reaction-prompt .reaction-flavor {
-  margin: 0 0 6px 0;
+  margin: 0.25rem 0;
+  font-size: var(--font-size-12, 12px);
 }
 
 .crucible-reaction-prompt .reaction-buttons {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+  margin-top: 0.25rem;
 }
 
 .crucible-reaction-prompt .reaction-buttons button {
-  flex: 1;
+  flex: 1 1 auto;
+  white-space: nowrap;
   line-height: 1.6;
 }
 
 .crucible-reaction-prompt .reaction-resolved {
-  margin: 0;
+  margin: 0.25rem 0 0;
   font-style: italic;
   opacity: 0.8;
   text-align: center;
