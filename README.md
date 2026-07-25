@@ -91,6 +91,13 @@ already prompted recently, etc.). Set `DEBUG = false` at the top of
     accounts for equipped weapon reach, or a spell gesture's range for
     Counterspell). An actor across the battlefield never gets prompted for
     an ability they can't actually reach the target with.
+    Skipped for **Reactive Strike/Intercept** (the `engagementLeft`/
+    `engagementEntered` triggers) specifically — those are only ever raised
+    after Crucible's own live `token.engagement` set has already confirmed
+    the target just crossed that same reach threshold, so re-measuring
+    linear range against the target's now-landed position would reject the
+    exact moment the trigger exists to catch (leaving engagement and being
+    out of weapon range are, for a normal melee weapon, the same distance).
   - Anything neither check can see yet (e.g. a Champion's Dominance bypass,
     or Counterspell's "must still be the last action" requirement) is left
     to the real `action.use()` call to enforce — a prompt that turns out to

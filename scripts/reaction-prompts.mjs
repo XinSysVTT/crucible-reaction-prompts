@@ -690,7 +690,17 @@ async function evaluateActorReactions(reactorToken, triggerType, targetToken, so
       continue;
     }
 
-    if (!isTargetInRange(action, reactorToken, targetToken)) {
+    // engagementLeft/engagementEntered are driven entirely off Crucible's own live token.engagement set
+    // (see checkEngagementLeft), which is already the authoritative "are they within reach" determination -
+    // it's computed from actor.system.movement.engagement (base 1 + reach-weapon bonus), the same radius a
+    // normal melee weapon's range.maximum resolves to. Re-running a linear range check on top of that here
+    // would re-measure the target at its CURRENT (already landed) position, and for "engagementLeft" that
+    // position is, by definition, the moment they just crossed OUTSIDE that same radius - so the check below
+    // would almost always fail and silently swallow the one trigger it's supposed to enable. Skip it for
+    // both triggers and let the real action.use() call (which runs while movement is still paused at the
+    // crossing square - see interceptMove/waitForReactionWindow) be the final, authoritative range word.
+    const skipRangeGate = (triggerType === "engagementLeft") || (triggerType === "engagementEntered");
+    if (!skipRangeGate && !isTargetInRange(action, reactorToken, targetToken)) {
       log(actor.name, actionId, "target", targetToken.actor?.name, "is out of range - no prompt");
       continue;
     }
@@ -706,6 +716,7 @@ async function evaluateActorReactions(reactorToken, triggerType, targetToken, so
  * range.minimum/range.maximum, which already accounts for equipped weapon reach) that the system's own
  * single-target acquisition performs when the action is actually used - so this stays in sync with
  * whatever the action's real range is, including reach weapons, without duplicating that logic.
+ * Not used for engagementLeft/engagementEntered - see the skipRangeGate comment in evaluateActorReactions.
  * @param {object} action        A prepared CrucibleAction instance.
  * @param {Token} reactorToken
  * @param {Token} targetToken
