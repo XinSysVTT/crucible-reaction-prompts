@@ -189,6 +189,14 @@ Hooks.on("refreshToken", token => {
   if (!isAuthoritativeClient()) return;
   if (!game.combat?.started) return;
   if (!token.actor || (token.actor.type === "group")) return;
+  // A left-click drag animates a temporary preview clone across the canvas as the mouse moves, and that
+  // clone fires refreshToken on every frame just like a real placeable would - well before the move is
+  // ever committed (or even finished being dragged; the user might drag back out again). Reacting to those
+  // preview frames posts a "real" whispered prompt for a position that was never actually landed on, and
+  // that premature prompt then eats the RECENT_PROMPT_WINDOW_MS debounce slot that the real, committed
+  // landing needs later - see the interceptMove/waitForReactionWindow flow above, which depends on exactly
+  // one authoritative prompt being posted once the (possibly truncated) move actually lands.
+  if (token.isPreview) return;
   checkEngagementLeft(token);
 });
 
@@ -197,6 +205,8 @@ function checkEngagementLeft(token) {
   if (!currentEnemies) return;
   const currentIds = new Set([...currentEnemies].map(t => t.id));
   const previousIds = lastEngagement.get(token.id);
+  log(token.name, "REAL engagement set now:", [...currentEnemies].map(t => t.name),
+    "(was:", previousIds ? [...previousIds].map(id => canvas.tokens?.get(id)?.name) : "no baseline", ")");
   lastEngagement.set(token.id, currentIds);
   if (!previousIds) return; // No baseline yet for this token - nothing to diff.
 
@@ -234,11 +244,14 @@ Hooks.on("deleteCombat", () => lastEngagement.clear());
 /*  already landed - so a single multi-square drag only ever gets checked at its final resting position,  */
 /*  never at the intermediate squares where a reactor's engagement radius was actually crossed. Foundry    */
 /*  v14 has no generic "pause mid-animation on an arbitrary condition" hook (that's Region-only - see the  */
-/*  Regions system), but it does have preMoveToken, which fires before a move commits with the *entire*    */
-/*  planned path (move.pending.waypoints, already expanded to one entry per grid cell - see              */
-/*  TokenDocument#getCompleteMovementPath) available up front, and which can reject the move outright.     */
+/*  Regions system), but it does have preMoveToken, which fires before a move commits with the path this   */
+/*  update is about to commit right now (move.passed.waypoints, already expanded to one entry per grid     */
+/*  cell - see TokenDocument#getCompleteMovementPath) available up front, and which can reject it outright.*/
+/*  (move.pending.waypoints is a different thing - it's only the not-yet-committed remainder of a multi-leg*/
+/*  *planned* route beyond a checkpoint, e.g. a queued ruler drag. For an ordinary single-destination move  */
+/*  it's always empty, since nothing ever gets split into it - so it must NOT be used here.)                */
 /*                                                                                                          */
-/*  So instead of a true mid-stride freeze-frame, this walks that planned path looking for the earliest    */
+/*  So instead of a true mid-stride freeze-frame, this walks that committed path looking for the earliest  */
 /*  square where a hostile reactor's range condition would flip (out of range <-> in range), truncates the */
 /*  move there, lets it land for real (so the normal refreshToken/checkEngagementLeft path above does the  */
 /*  actual, authoritative detection against Crucible's own engagement math), waits for any prompt(s) that  */
@@ -262,14 +275,28 @@ const PROMPT_RESOLUTION_TIMEOUT_MS = 60000;
 
 Hooks.on("preMoveToken", (document, move, options) => {
   if (game.system.id !== "crucible") return true;
-  if (replayingMovement.has(document.id)) return true; // our own already-vetted re-issued leg
-  if (!game.combat?.started) return true;
-  if (!document.actor || (document.actor.type === "group")) return true;
-  // preMoveToken fires on every connected client, but only the client actually driving the move sees a
-  // move.user that is themselves - everyone else would just be duplicating (and racing) the same check.
-  if (!move.user?.isSelf) return true;
-  if (!move.pending?.waypoints?.length) return true;
+  if (replayingMovement.has(document.id)) {
+    log(document.name, "preMoveToken: skipping - this is our own re-issued leg");
+    return true;
+  }
+  if (!game.combat?.started) {
+    log(document.name, "preMoveToken: skipping - no combat is active");
+    return true;
+  }
+  if (!document.actor || (document.actor.type === "group")) {
+    log(document.name, "preMoveToken: skipping - no actor, or a group actor");
+    return true;
+  }
+  // NOTE: preMoveToken has no `user` property on the movement object in v13/v14 - it only fires on the
+  // client that initiated the move to begin with (per Foundry's own API docs), so no self-check is needed
+  // or possible here. (Previously this guard checked move.user?.isSelf, which never existed and always
+  // bailed - see commit history.)
+  if (!move.passed?.waypoints?.length) {
+    log(document.name, "preMoveToken: skipping - move.passed.waypoints is empty", move);
+    return true;
+  }
 
+  log(document.name, `preMoveToken: scanning ${move.passed.waypoints.length} waypoint(s) for reaction crossings`);
   let crossingIndex;
   try {
     crossingIndex = findEarliestReactionCrossing(document, move);
@@ -277,7 +304,10 @@ Hooks.on("preMoveToken", (document, move, options) => {
     console.error(`${MODULE_ID} | error scanning planned path for reaction crossings - allowing move`, err);
     return true; // a bug in our path scan should never be able to block ordinary movement
   }
-  if (crossingIndex < 0) return true;
+  if (crossingIndex < 0) {
+    log(document.name, "preMoveToken: no reaction crossing found in this path - allowing move uninterrupted");
+    return true;
+  }
 
   interceptMove(document, move, options, crossingIndex)
     .catch(err => console.error(`${MODULE_ID} | error handling intercepted movement`, err));
@@ -285,14 +315,15 @@ Hooks.on("preMoveToken", (document, move, options) => {
 });
 
 /**
- * Walk a token's planned path looking for the first waypoint at which some hostile reactor's registered
- * engagementLeft/engagementEntered action would flip between out-of-range and in-range relative to the mover.
- * This is a cheap proxy for "did engagement actually change" (Crucible's real engagement math is bounds- and
- * wall-aware, via Token#getEngagementRectangle/movePolygon) - it only needs to be good enough to pick roughly
- * the right square to pause at. The truncated move landing for real is what triggers the authoritative check.
+ * Walk the portion of a token's move that's actually about to be committed (move.passed.waypoints) looking
+ * for the first waypoint at which some hostile reactor's registered engagementLeft/engagementEntered action
+ * would flip between out-of-range and in-range relative to the mover. This is a cheap proxy for "did
+ * engagement actually change" (Crucible's real engagement math is bounds- and wall-aware, via
+ * Token#getEngagementRectangle/movePolygon) - it only needs to be good enough to pick roughly the right
+ * square to pause at. The truncated move landing for real is what triggers the authoritative check.
  * @param {TokenDocument} document
  * @param {TokenMovementData} move
- * @returns {number} The index into move.pending.waypoints to truncate at (inclusive), or -1 if no crossing.
+ * @returns {number} The index into move.passed.waypoints to truncate at (inclusive), or -1 if no crossing.
  */
 function findEarliestReactionCrossing(document, move) {
   const moverToken = document.object;
@@ -302,13 +333,31 @@ function findEarliestReactionCrossing(document, move) {
   for (const combatant of game.combat?.combatants ?? []) {
     const reactorToken = combatant.token?.object;
     if (!reactorToken || (reactorToken === moverToken) || !reactorToken.actor) continue;
-    if (!areEnemies(reactorToken, moverToken)) continue;
+    if (!areEnemies(reactorToken, moverToken)) {
+      log(document.name, "crossing-scan: skipping", reactorToken.actor?.name, "- not hostile to mover");
+      continue;
+    }
     for (const [actionId, trigger] of ACTION_TRIGGERS) {
       if ((trigger !== "engagementLeft") && (trigger !== "engagementEntered")) continue;
       const action = reactorToken.actor.actions?.[actionId];
-      if (!action) continue;
-      const {minimum, maximum} = action.range ?? {};
-      if (!minimum && !maximum) continue; // No distance restriction - can't "cross" in or out of it.
+      if (!action) {
+        log(document.name, "crossing-scan: skipping", reactorToken.actor?.name, actionId, "- actor has no such action");
+        continue;
+      }
+      // engagementLeft/engagementEntered are keyed off the reactor's live engagement radius
+      // (actor.system.movement.engagement = baseEngagement + per-weapon "engaging" bonus - see
+      // actor-base.mjs), NOT the action's own range.minimum/maximum. reactiveStrike/intercept both
+      // declare range:{weapon:true}, which resolves to the equipped weapon's attack reach - a distinct,
+      // unrelated stat (e.g. a reach polearm can have attack range 3 while engagement is still 1). Using
+      // action.range here was why the scan never saw a crossing: it kept treating the mover as "in range"
+      // out to the weapon's reach, well past the point where the real engagement-radius check (used by
+      // checkEngagementLeft) had already flipped.
+      const engagement = reactorToken.actor.system.movement?.engagement;
+      if (!engagement) {
+        log(document.name, "crossing-scan: skipping", reactorToken.actor?.name, actionId,
+          "- actor has no engagement radius", engagement);
+        continue;
+      }
       // _canUse() takes no target/position argument - it's purely the reactor's own resource/state gate
       // (Action Points, the "reaction" tag's turn-state checks, etc.), same call evaluateActorReactions
       // makes before its own isTargetInRange check. Filtering on it here avoids splitting and pausing the
@@ -316,36 +365,49 @@ function findEarliestReactionCrossing(document, move) {
       // this round, incapacitated, out of resources, not their kind of turn state, ...).
       try {
         action._canUse();
-      } catch {
+      } catch (err) {
+        log(document.name, "crossing-scan: skipping", reactorToken.actor?.name, actionId,
+          "- _canUse() rejected:", err?.message ?? err);
         continue;
       }
-      candidates.push({reactorToken, action});
+      log(document.name, "crossing-scan: candidate -", reactorToken.actor?.name, actionId,
+        "engagement radius", engagement);
+      candidates.push({reactorToken, action, engagement});
     }
   }
-  if (!candidates.length) return -1;
+  if (!candidates.length) {
+    log(document.name, "crossing-scan: no eligible reactors found - nothing to intercept for");
+    return -1;
+  }
 
   const footprintOf = wp => ({x: wp.x, y: wp.y, elevation: wp.elevation, width: wp.width, height: wp.height,
     depth: wp.depth});
-  const inRange = (action, reactorToken, footprint) => {
-    const {minimum, maximum} = action.range ?? {};
+  const inRange = (engagement, reactorToken, footprint) => {
     const range = crucible.api.canvas.grid.getLinearRange(reactorToken.document, footprint);
-    if (minimum && (range < minimum)) return false;
-    if (maximum && (range > maximum)) return false;
-    return true;
+    // Crucible's real engagement math treats a range EQUAL to the radius as already outside engagement
+    // (confirmed empirically: a measured range of exactly the engagement radius landed with the real
+    // token.engagement.enemies set no longer containing the reactor) - so this must be a strict "<",
+    // not "<=". Getting this wrong in the generous direction is exactly why the scan kept reporting
+    // "still in range" at the token's actual final square while the real, authoritative check disagreed.
+    const result = range < engagement;
+    log(document.name, "crossing-scan: measured range", range, "vs engagement", engagement,
+      "for", reactorToken.actor?.name, "at footprint", {x: footprint.x, y: footprint.y}, "->", result);
+    return result;
   };
 
   const origin = {x: document.x, y: document.y, elevation: document.elevation, width: document.width,
     height: document.height, depth: document.depth};
-  let previous = candidates.map(({reactorToken, action}) => inRange(action, reactorToken, origin));
+  let previous = candidates.map(({reactorToken, engagement}) => inRange(engagement, reactorToken, origin));
+  log(document.name, "crossing-scan: starting in-range state per candidate:", previous);
 
-  for (let i = 0; i < move.pending.waypoints.length; i++) {
-    const footprint = footprintOf(move.pending.waypoints[i]);
+  for (let i = 0; i < move.passed.waypoints.length; i++) {
+    const footprint = footprintOf(move.passed.waypoints[i]);
     for (let c = 0; c < candidates.length; c++) {
-      const {reactorToken, action} = candidates[c];
-      const now = inRange(action, reactorToken, footprint);
+      const {reactorToken, action, engagement} = candidates[c];
+      const now = inRange(engagement, reactorToken, footprint);
       if (now !== previous[c]) {
         log(document.name, "planned path crosses", reactorToken.actor?.name, "'s", action.id,
-          "range at waypoint", i, "of", move.pending.waypoints.length);
+          "range at waypoint", i, "of", move.passed.waypoints.length);
         return i;
       }
       previous[c] = now;
@@ -367,9 +429,12 @@ async function interceptMove(document, move, options, crossingIndex) {
   const toWaypointInput = wp => ({x: wp.x, y: wp.y, elevation: wp.elevation, width: wp.width, height: wp.height,
     depth: wp.depth, shape: wp.shape, level: wp.level, action: wp.action, snapped: wp.snapped,
     explicit: wp.explicit, checkpoint: wp.checkpoint});
-  const upTo = move.pending.waypoints.slice(0, crossingIndex + 1).map(toWaypointInput);
-  const remaining = move.pending.waypoints.slice(crossingIndex + 1).map(toWaypointInput);
+  const upTo = move.passed.waypoints.slice(0, crossingIndex + 1).map(toWaypointInput);
+  const remaining = move.passed.waypoints.slice(crossingIndex + 1).map(toWaypointInput);
   const carryOptions = {animation: options.animation, autoRotate: move.autoRotate, showRuler: move.showRuler};
+
+  log(document.name, `intercepting move: truncating to waypoint ${crossingIndex}`,
+    `(${upTo.length} waypoint(s) landing now, ${remaining.length} held back)`);
 
   // Guarded only for this exact truncated leg: it deliberately ends ON the waypoint where the crossing was
   // detected, so re-scanning it unguarded could immediately re-detect that same boundary at its last waypoint
@@ -377,17 +442,37 @@ async function interceptMove(document, move, options, crossingIndex) {
   // rest of the path crosses a second, later reaction opportunity, preMoveToken firing again for it is exactly
   // what lets this pause a second time instead of sailing through it.
   replayingMovement.add(document.id);
+
+  // Start listening for a reaction prompt BEFORE the truncated move lands, not after. TokenDocument#move()'s
+  // promise only resolves once the move's full animation finishes, but the refreshToken -> checkEngagementLeft
+  // -> evaluateActorReactions -> postReactionPrompt chain that actually posts the prompt reads the token's
+  // already-committed document position, which updates (and can fire that whole chain to completion) well
+  // before the animation-bound promise below resolves - especially when this client is also the authoritative
+  // GM client running that check. Registering the listener only after awaiting the move can miss a prompt
+  // that was created and broadcast in the meantime, since Hooks can't retroactively deliver a past event.
+  const {promise: moveSettled, resolve: resolveMoveSettled} = Promise.withResolvers();
+  const reactionWindow = waitForReactionWindow(document.actor, moveSettled);
+
   let completed;
+  const legStart = performance.now();
   try {
     completed = await document.move(upTo, carryOptions);
   } finally {
     replayingMovement.delete(document.id);
+    resolveMoveSettled();
   }
+  log(document.name, "truncated leg landed, completed:", completed, "- now at", document.x, document.y,
+    `(${Math.round(performance.now() - legStart)}ms elapsed - if this is ~0ms, the leg teleported instead of animating)`);
   if (!completed || !remaining.length) return;
 
-  await waitForReactionWindow(document.actor);
+  log(document.name, "holding remaining movement, waiting on reaction window...");
+  const waitStart = performance.now();
+  await reactionWindow;
+  log(document.name, "reaction window closed - resuming remaining movement to original destination",
+    `(waited ${Math.round(performance.now() - waitStart)}ms)`);
 
   await document.move(remaining, carryOptions);
+  log(document.name, "resumed movement completed - now at", document.x, document.y);
 }
 
 /**
@@ -395,10 +480,14 @@ async function interceptMove(document, move, options, crossingIndex) {
  * may not be this client at all, so this only ever watches for the normal networked createChatMessage
  * broadcast rather than assuming any local handoff) and then be resolved.
  * @param {CrucibleActor} moverActor
+ * @param {Promise<void>} moveSettled  Resolves once the triggering move has actually landed - nothing can be
+ *   prompted before that, so the "nothing new showed up" quiet-period countdown doesn't start until then, even
+ *   though this starts listening for the createChatMessage broadcast immediately.
  */
-async function waitForReactionWindow(moverActor) {
+async function waitForReactionWindow(moverActor, moveSettled) {
   const watched = new Map(); // messageId -> resolution promise
   let settleTimer;
+  let armed = false; // true once the triggering move has landed and the quiet-period countdown is live
   const {promise: arrivalWindowClosed, resolve: closeArrivalWindow} = Promise.withResolvers();
   const rearmArrivalWindow = () => {
     clearTimeout(settleTimer);
@@ -409,9 +498,12 @@ async function waitForReactionWindow(moverActor) {
     const flags = message.flags?.[FLAG_SCOPE];
     if (!flags || (flags.targetUuid !== moverActor.uuid) || flags.resolved) return;
     watched.set(message.id, registerPromptResolution(message.id));
-    rearmArrivalWindow();
+    if (armed) rearmArrivalWindow(); // a prompt arriving pre-armed is already captured; the countdown starts below
   };
   Hooks.on("createChatMessage", onPrompt);
+
+  await moveSettled;
+  armed = true;
   rearmArrivalWindow();
 
   const hardTimeout = () => new Promise(resolve => setTimeout(resolve, PROMPT_RESOLUTION_TIMEOUT_MS));
@@ -692,13 +784,16 @@ async function evaluateActorReactions(reactorToken, triggerType, targetToken, so
 
     // engagementLeft/engagementEntered are driven entirely off Crucible's own live token.engagement set
     // (see checkEngagementLeft), which is already the authoritative "are they within reach" determination -
-    // it's computed from actor.system.movement.engagement (base 1 + reach-weapon bonus), the same radius a
-    // normal melee weapon's range.maximum resolves to. Re-running a linear range check on top of that here
-    // would re-measure the target at its CURRENT (already landed) position, and for "engagementLeft" that
-    // position is, by definition, the moment they just crossed OUTSIDE that same radius - so the check below
-    // would almost always fail and silently swallow the one trigger it's supposed to enable. Skip it for
-    // both triggers and let the real action.use() call (which runs while movement is still paused at the
-    // crossing square - see interceptMove/waitForReactionWindow) be the final, authoritative range word.
+    // it's computed from actor.system.movement.engagement (baseEngagement + per-weapon "engaging" bonus -
+    // see actor-base.mjs). NOTE: this is NOT the same radius as this action's own range.maximum - reactiveStrike/
+    // intercept both declare range:{weapon:true}, which resolves to the equipped weapon's attack reach, a
+    // distinct stat (a reach polearm can attack out to 3 while engagement is still 1). Re-running a linear
+    // range check against action.range here would therefore be checking the wrong number entirely, on top of
+    // re-measuring the target at its CURRENT (already landed) position - and for "engagementLeft" that
+    // position is, by definition, the moment they just crossed OUTSIDE the (correct, engagement-radius) bound
+    // - so the check below would almost always fail and silently swallow the one trigger it's supposed to
+    // enable. Skip it for both triggers and let the real action.use() call (which runs while movement is
+    // still paused at the crossing square - see interceptMove/waitForReactionWindow) be the final word.
     const skipRangeGate = (triggerType === "engagementLeft") || (triggerType === "engagementEntered");
     if (!skipRangeGate && !isTargetInRange(action, reactorToken, targetToken)) {
       log(actor.name, actionId, "target", targetToken.actor?.name, "is out of range - no prompt");
@@ -839,8 +934,10 @@ async function postReactionPrompt({actor, reactorToken, action, targetToken, tri
     flags: {
       [FLAG_SCOPE]: {
         reactorUuid: actor.uuid,
+        reactorTokenId: reactorToken.id,
         actionId: action.id,
         targetUuid: targetToken.actor.uuid,
+        targetTokenId: targetToken.id,
         triggerType
       }
     }
@@ -891,7 +988,7 @@ Hooks.on("renderChatMessageHTML", (message, html) => {
 async function onUseReaction(message, promptEl) {
   if (message.getFlag(FLAG_SCOPE, "resolved")) return;
 
-  const {reactorUuid, actionId, targetUuid} = message.flags[FLAG_SCOPE] ?? {};
+  const {reactorUuid, reactorTokenId, actionId, targetUuid, targetTokenId} = message.flags[FLAG_SCOPE] ?? {};
   const actor = fromUuidSync(reactorUuid);
   if (!actor) return ui.notifications.warn("That actor could no longer be found.");
 
@@ -902,9 +999,23 @@ async function onUseReaction(message, promptEl) {
 
   if (!actor.actions?.[actionId]) return ui.notifications.warn(`${actor.name} no longer has that action available.`);
 
-  // Target the token whose event triggered this prompt, so the action's own targeting logic just works.
-  const targetActor = fromUuidSync(targetUuid);
-  const targetToken = targetActor?.getActiveTokens()[0];
+  // Control the SPECIFIC token that triggered this prompt before acting, not just whichever token the actor
+  // happens to resolve to internally. This matters most for a linked actor with more than one token placed on
+  // the scene (e.g. two placements of the same NPC) - actor.useAction() has no token context of its own to go
+  // on, so without an explicit control() here it's free to resolve to whichever token comes first internally,
+  // which may be a stray/duplicate token far from this fight entirely. Opening the sheet directly from the
+  // correct token doesn't have this ambiguity, which is why that path already worked correctly.
+  const reactorToken = reactorTokenId && canvas.tokens?.get(reactorTokenId);
+  if (reactorToken && !reactorToken.controlled) reactorToken.control({releaseOthers: true});
+
+  // Target the SPECIFIC token that triggered this prompt, not just "the first active token for this actor" -
+  // if more than one token happens to share an actor setup (e.g. two similarly-configured unlinked NPCs both
+  // named "tester"), re-deriving the token from the actor at click-time is ambiguous and can silently grab the
+  // wrong one, measuring range against a token that was never actually involved in this reaction. canvas.tokens
+  // is keyed by Token id, which is unique regardless of how many tokens share similar actor data - falls back to
+  // the old actor-based lookup only if that exact token document is gone (e.g. deleted mid-combat).
+  const targetToken = (targetTokenId && canvas.tokens?.get(targetTokenId))
+    ?? fromUuidSync(targetUuid)?.getActiveTokens()[0];
   if (targetToken) targetToken.setTarget(true, {releaseOthers: true, user: game.user});
 
   // actor.useAction() is the same public entry point the character sheet itself calls (see
