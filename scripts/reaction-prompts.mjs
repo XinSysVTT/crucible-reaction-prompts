@@ -189,6 +189,19 @@ Hooks.once("ready", () => {
 /** Last known set of engaged-enemy Token ids, per reactor Token id, so departures can be diffed out. */
 const lastEngagement = new Map();
 
+// Foundry redraws every token when a scene/world loads, and refreshToken can fire more than once per
+// token while placeables are still settling into their final position (fade-in, sort order, etc.) -
+// not because anyone actually moved. Diffing against a baseline captured mid-settle can register a
+// bogus "entered/left engagement" and fire a false Reactive Strike/Intercept prompt the moment you log
+// in. Clear any stale baselines from a previous scene/session, and ignore diffs entirely for a short
+// grace window after the canvas becomes ready so only genuinely post-load movement gets diffed.
+const CANVAS_SETTLE_MS = 1000;
+let canvasSettledAt = 0;
+Hooks.on("canvasReady", () => {
+  lastEngagement.clear();
+  canvasSettledAt = Date.now() + CANVAS_SETTLE_MS;
+});
+
 Hooks.on("refreshToken", token => {
   if (game.system.id !== "crucible") return;
   if (!isAuthoritativeClient()) return;
@@ -214,6 +227,10 @@ function checkEngagementLeft(token) {
     "(was:", previousIds ? [...previousIds].map(id => canvas.tokens?.get(id)?.name) : "no baseline", ")");
   lastEngagement.set(token.id, currentIds);
   if (!previousIds) return; // No baseline yet for this token - nothing to diff.
+  if (Date.now() < canvasSettledAt) {
+    log(token.name, "engagement diff skipped - canvas is still settling after load");
+    return;
+  }
 
   // IMPORTANT: Foundry's refreshToken hook only fires for the token that actually moved (call it the
   // "mover") - not for the other, stationary tokens whose engagement set changed only as a side effect of
