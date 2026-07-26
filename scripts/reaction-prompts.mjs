@@ -774,7 +774,16 @@ async function evaluateActorReactions(reactorToken, triggerType, targetToken, so
       log(actor.name, actionId, "skipped - already prompted for this within the debounce window");
       continue;
     }
-    recentPrompts.set(key, now);
+
+    // Give the triggering ChatMessage a tick to finish settling into game.messages before asking the
+    // real action._canUse() to look it up as "the last action" - canUse hooks like _canUsePostDefend
+    // (see HOOKS.counterRiposte etc. in Crucible's module/hooks/action.mjs) call
+    // ChatMessage.implementation.getLastAction() themselves, which re-derives from game.messages.contents.
+    // Calling that synchronously inside this createChatMessage hook can race the message's own insertion,
+    // producing a false "not eligible" the instant the triggering message is created even though the
+    // underlying roll result (e.g. a genuine Parry) is already resolved. Yielding one microtask/frame is
+    // enough for that to settle without meaningfully delaying the prompt from the player's perspective.
+    await new Promise(resolve => requestAnimationFrame(resolve));
 
     let eligibilityError = null;
     try {
@@ -786,6 +795,10 @@ async function evaluateActorReactions(reactorToken, triggerType, targetToken, so
       log(actor.name, actionId, "not eligible right now:", eligibilityError.message ?? eligibilityError);
       continue;
     }
+
+    // Only claim the debounce slot once we know this is a real, eligible opportunity - a failed
+    // eligibility check above should never block a later, genuinely eligible attempt at the same key.
+    recentPrompts.set(key, now);
 
     // engagementLeft/engagementEntered are driven entirely off Crucible's own live token.engagement set
     // (see checkEngagementLeft), which is already the authoritative "are they within reach" determination -
