@@ -186,20 +186,32 @@ Hooks.once("ready", () => {
 /*            Engagement Entered (Intercept)             */
 /* -------------------------------------------- */
 
-/** Last known set of engaged-enemy Token ids, per reactor Token id, so departures can be diffed out. */
+/** Last CONFIRMED engaged-enemy Token id set, per reactor Token id - the value diffs are actually taken against. */
 const lastEngagement = new Map();
 
-// Foundry redraws every token when a scene/world loads, and refreshToken can fire more than once per
-// token while placeables are still settling into their final position (fade-in, sort order, etc.) -
-// not because anyone actually moved. Diffing against a baseline captured mid-settle can register a
-// bogus "entered/left engagement" and fire a false Reactive Strike/Intercept prompt the moment you log
-// in. Clear any stale baselines from a previous scene/session, and ignore diffs entirely for a short
-// grace window after the canvas becomes ready so only genuinely post-load movement gets diffed.
-const CANVAS_SETTLE_MS = 1000;
-let canvasSettledAt = 0;
+/** The most recent raw reading per reactor Token id, not yet confirmed stable (see checkEngagementLeft). */
+const pendingEngagement = new Map();
+
+function setsEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const id of a) if (!b.has(id)) return false;
+  return true;
+}
+
+// Foundry redraws every token when a scene/world loads, and Crucible's own engagement/vision math isn't
+// necessarily finished initializing by the first couple of refreshToken firings that follow - it's been
+// observed reporting an empty engagement set for a token that's actually been standing right next to an
+// enemy the whole time, only to correct itself a moment later. If that transient wrong reading gets
+// locked in as the baseline, the very next (correct) reading looks exactly like a real "entered/left
+// engagement" transition and fires a false Reactive Strike/Intercept prompt on login even though nobody
+// moved. There's no reliable one-shot "engagement math is now trustworthy" signal to wait for, so instead
+// a reading is only promoted to the confirmed baseline (and therefore eligible for diffing) once it's
+// been observed twice in a row, unchanged - a transient glitch won't repeat, but a genuinely settled
+// value (whether at load or after real movement finally comes to rest) will. Clear both maps on scene
+// load so nothing stale leaks in from a previous scene/session either.
 Hooks.on("canvasReady", () => {
   lastEngagement.clear();
-  canvasSettledAt = Date.now() + CANVAS_SETTLE_MS;
+  pendingEngagement.clear();
 });
 
 Hooks.on("refreshToken", token => {
@@ -223,14 +235,23 @@ function checkEngagementLeft(token) {
   if (!currentEnemies) return;
   const currentIds = new Set([...currentEnemies].map(t => t.id));
   const previousIds = lastEngagement.get(token.id);
+  const pendingIds = pendingEngagement.get(token.id);
   log(token.name, "REAL engagement set now:", [...currentEnemies].map(t => t.name),
-    "(was:", previousIds ? [...previousIds].map(id => canvas.tokens?.get(id)?.name) : "no baseline", ")");
-  lastEngagement.set(token.id, currentIds);
-  if (!previousIds) return; // No baseline yet for this token - nothing to diff.
-  if (Date.now() < canvasSettledAt) {
-    log(token.name, "engagement diff skipped - canvas is still settling after load");
+    "(confirmed baseline:", previousIds ? [...previousIds].map(id => canvas.tokens?.get(id)?.name) : "none yet",
+    ")");
+
+  // This reading doesn't match the last one seen - it's not stable yet. Record it as the new pending
+  // candidate and wait for a second, matching reading before trusting it for anything.
+  if (!pendingIds || !setsEqual(pendingIds, currentIds)) {
+    pendingEngagement.set(token.id, currentIds);
     return;
   }
+
+  // Confirmed stable (this reading matches the immediately preceding one). Promote it to the baseline.
+  const hadConfirmedBaseline = !!previousIds;
+  lastEngagement.set(token.id, currentIds);
+  if (!hadConfirmedBaseline) return; // Nothing confirmed yet to diff against.
+  if (setsEqual(previousIds, currentIds)) return; // No actual change since the last confirmed baseline.
 
   // IMPORTANT: Foundry's refreshToken hook only fires for the token that actually moved (call it the
   // "mover") - not for the other, stationary tokens whose engagement set changed only as a side effect of
@@ -256,8 +277,14 @@ function checkEngagementLeft(token) {
 }
 
 // Tokens are deleted or leave combat: drop their stale baselines so memory doesn't grow unbounded.
-Hooks.on("deleteToken", tokenDoc => lastEngagement.delete(tokenDoc.id));
-Hooks.on("deleteCombat", () => lastEngagement.clear());
+Hooks.on("deleteToken", tokenDoc => {
+  lastEngagement.delete(tokenDoc.id);
+  pendingEngagement.delete(tokenDoc.id);
+});
+Hooks.on("deleteCombat", () => {
+  lastEngagement.clear();
+  pendingEngagement.clear();
+});
 
 /* -------------------------------------------- */
 /*  Movement Interception (block-and-retry)      */
@@ -966,6 +993,17 @@ async function postReactionPrompt({actor, reactorToken, action, targetToken, tri
     content,
     whisper,
     speaker: {alias: "Reaction Available"},
+    // Every prompt is created by the active GM's client (see isAuthoritativeClient), which would
+    // otherwise leave the GM as the message's sole author. Without explicit ownership here, a player
+    // clicking Use/Not now on their OWN reactor's prompt has no permission to persist that resolution
+    // (see resolveMessage's message.isOwner check below) - it would only update their local UI, and the
+    // message would still read as unresolved for everyone, including that same player on their next
+    // reload. Granting OWNER to every whisper recipient lets whichever of them actually acts on it save
+    // that resolution for real.
+    ownership: {
+      default: CONST.DOCUMENT_OWNERSHIP_LEVELS.NONE,
+      ...Object.fromEntries(whisper.map(userId => [userId, CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER]))
+    },
     flags: {
       [FLAG_SCOPE]: {
         reactorUuid: actor.uuid,
@@ -1087,8 +1125,10 @@ async function onDismissReaction(message, promptEl) {
 async function resolveMessage(message, promptEl, resolution) {
   if (resolution === "cancelled") return; // The user opened the dialog and closed it - leave the prompt live.
   lockPromptUI(promptEl, resolution);
-  const canUpdate = game.user.isGM || message.isAuthor;
-  if (canUpdate) {
+  // isOwner reflects the explicit per-user ownership granted in postReactionPrompt (every whisper
+  // recipient, not just the GM/author) - this is what actually lets the reacting player's own click
+  // persist, rather than only ever updating their local UI (see the note on ChatMessage.create above).
+  if (message.isOwner) {
     await message.setFlag(FLAG_SCOPE, "resolved", true);
     await message.setFlag(FLAG_SCOPE, "resolution", resolution);
   }
