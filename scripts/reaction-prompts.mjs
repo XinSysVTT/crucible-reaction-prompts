@@ -93,7 +93,12 @@ const ACTION_TRIGGERS = new Map([
   // themselves, once per round (Crucible's own HOOKS.coveringFire enforces the once-per-round part; this
   // module just needs to notice the moment). Broader than the existing spellCast/meleeDefense triggers,
   // so it gets its own detector (checkEnemyTargetsOther) rather than reusing one of them.
-  ["coveringFire", "enemyActsAgainstOther"]
+  ["coveringFire", "enemyActsAgainstOther"],
+
+  // Adversary-only talent "Sacrifice Self" (packs/adversary-talents): the mirror of Interpose for
+  // monsters - take a hit meant for a nearby ally, destroying itself in the process. Same trigger as
+  // interpose since the moment that matters ("an ally is about to be struck") is identical.
+  ["sacrificeSelf", "allyStruck"]
 ]);
 
 /**
