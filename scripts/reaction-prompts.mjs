@@ -516,13 +516,28 @@ async function interceptMove(document, move, options, crossingIndex) {
 
   log(document.name, "holding remaining movement, waiting on reaction window...");
   const waitStart = performance.now();
-  await reactionWindow;
+  const blocked = await reactionWindow;
+  if (blocked) {
+    log(document.name, "movement BLOCKED by a used reaction (e.g. Intercept) - not resuming remaining path",
+      `(waited ${Math.round(performance.now() - waitStart)}ms)`);
+    return;
+  }
   log(document.name, "reaction window closed - resuming remaining movement to original destination",
     `(waited ${Math.round(performance.now() - waitStart)}ms)`);
 
   await document.move(remaining, carryOptions);
   log(document.name, "resumed movement completed - now at", document.x, document.y);
 }
+
+/**
+ * Trigger types whose reactions are meant to physically stop the mover, not just get a free action off
+ * against them. If any prompt with one of these trigger types is actually USED (not dismissed/timed out),
+ * the mover's remaining, not-yet-committed waypoints are cancelled instead of replayed - see the "blocked"
+ * return value below. Reactive Strike's "engagementLeft" is deliberately NOT in this set: the mover has
+ * already left by the time that reaction fires, so there's nothing left to stop them from continuing.
+ * @type {Set<string>}
+ */
+const BLOCKING_TRIGGERS = new Set(["engagementEntered"]);
 
 /**
  * Wait for any reaction prompt(s) targeting this actor to arrive (posted by the authoritative GM client, which
@@ -532,9 +547,12 @@ async function interceptMove(document, move, options, crossingIndex) {
  * @param {Promise<void>} moveSettled  Resolves once the triggering move has actually landed - nothing can be
  *   prompted before that, so the "nothing new showed up" quiet-period countdown doesn't start until then, even
  *   though this starts listening for the createChatMessage broadcast immediately.
+ * @returns {Promise<boolean>} true if a BLOCKING_TRIGGERS reaction (e.g. Intercept) was actually used and the
+ *   mover's remaining movement should be cancelled rather than replayed.
  */
 async function waitForReactionWindow(moverActor, moveSettled) {
   const watched = new Map(); // messageId -> resolution promise
+  const triggerTypes = new Map(); // messageId -> triggerType, so Intercept can be told apart from Reactive Strike after the fact
   let settleTimer;
   let armed = false; // true once the triggering move has landed and the quiet-period countdown is live
   const {promise: arrivalWindowClosed, resolve: closeArrivalWindow} = Promise.withResolvers();
@@ -547,6 +565,7 @@ async function waitForReactionWindow(moverActor, moveSettled) {
     const flags = message.flags?.[FLAG_SCOPE];
     if (!flags || (flags.targetUuid !== moverActor.uuid) || flags.resolved) return;
     watched.set(message.id, registerPromptResolution(message.id));
+    triggerTypes.set(message.id, flags.triggerType);
     if (armed) rearmArrivalWindow(); // a prompt arriving pre-armed is already captured; the countdown starts below
   };
   Hooks.on("createChatMessage", onPrompt);
@@ -560,16 +579,37 @@ async function waitForReactionWindow(moverActor, moveSettled) {
   Hooks.off("createChatMessage", onPrompt);
   clearTimeout(settleTimer);
 
-  if (!watched.size) return;
+  if (!watched.size) return false;
   log("movement paused for", watched.size, "reaction prompt(s) targeting", moverActor.name);
-  await Promise.race([Promise.all(watched.values()), hardTimeout()]);
+  const messageIds = [...watched.keys()];
+  const resolutions = await Promise.race([Promise.all(watched.values()), hardTimeout()]);
+
+  // If the hard timeout won the race, Promise.race resolves with undefined (setTimeout's own callback
+  // passes no value) rather than an array - treat an unresolved-in-time prompt as non-blocking rather than
+  // stalling combat forever on a table that's gone quiet.
+  if (!Array.isArray(resolutions)) return false;
+
+  // Check whether any BLOCKING_TRIGGERS-type prompt (e.g. Intercept) actually resolved to "used" - reading
+  // the resolution value that came back through the promise itself (see registerPromptResolution/
+  // updateChatMessage above), not a fresh read of game.messages, so there's no separate document fetch that
+  // could observe a half-written state.
+  for (let i = 0; i < messageIds.length; i++) {
+    const triggerType = triggerTypes.get(messageIds[i]);
+    if (!BLOCKING_TRIGGERS.has(triggerType)) continue;
+    if (resolutions[i] === "used") {
+      log("blocking reaction", messageIds[i], "(trigger:", triggerType, ") was used - movement will be cancelled");
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
- * Get (creating if needed) a promise that resolves once the given reaction-prompt chat message is marked
- * resolved (used or dismissed) - see the "resolved" flag set in resolveMessage() below.
+ * Get (creating if needed) a promise that resolves, with the resolution string itself ("used" or
+ * "dismissed"), once the given reaction-prompt chat message is marked resolved - see the atomic
+ * resolved+resolution update in resolveMessage() above.
  * @param {string} messageId
- * @returns {Promise<void>}
+ * @returns {Promise<"used"|"dismissed">}
  */
 function registerPromptResolution(messageId) {
   let entry = promptResolutions.get(messageId);
@@ -582,10 +622,14 @@ function registerPromptResolution(messageId) {
 }
 
 Hooks.on("updateChatMessage", (message, changes) => {
-  if (!changes.flags?.[FLAG_SCOPE]?.resolved) return;
+  // Both keys are now written together in a single update (see resolveMessage) - reading resolution
+  // straight off this same change-delta means there's no separate document fetch that could race the
+  // write, and no reliance on message.getFlag() reflecting a value that hasn't synced to this client yet.
+  const resolution = changes.flags?.[FLAG_SCOPE]?.resolution;
+  if (!changes.flags?.[FLAG_SCOPE]?.resolved || !resolution) return;
   const entry = promptResolutions.get(message.id);
   if (!entry) return;
-  entry.resolve();
+  entry.resolve(resolution);
   promptResolutions.delete(message.id);
 });
 
@@ -1129,8 +1173,19 @@ async function resolveMessage(message, promptEl, resolution) {
   // recipient, not just the GM/author) - this is what actually lets the reacting player's own click
   // persist, rather than only ever updating their local UI (see the note on ChatMessage.create above).
   if (message.isOwner) {
-    await message.setFlag(FLAG_SCOPE, "resolved", true);
-    await message.setFlag(FLAG_SCOPE, "resolution", resolution);
+    // A single atomic update, NOT two separate setFlag() calls. Two calls means two separate document
+    // updates, and therefore two separate updateChatMessage firings with two separate change-deltas - the
+    // first carrying only "resolved: true" (resolution not yet written), the second carrying only
+    // "resolution: ..." (with "resolved" often absent from that diff since it didn't change on THIS update).
+    // waitForReactionWindow's blocking check listens for "resolved" to flip and then wants to read
+    // "resolution" - with two calls that first firing can land, and be observed by a remote client, before
+    // "resolution" has been written at all, so the blocking check sees resolution===undefined and wrongly
+    // concludes the reaction was never used. Setting both keys in one update guarantees any observer that
+    // sees "resolved" also already sees the correct "resolution" in that same change.
+    await message.update({
+      [`flags.${FLAG_SCOPE}.resolved`]: true,
+      [`flags.${FLAG_SCOPE}.resolution`]: resolution
+    });
   }
 }
 
