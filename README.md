@@ -11,6 +11,12 @@ could use a reaction — right now it watches for:
   moment you defend against a melee attack with the specific result
   (Dodge/Parry/Block) each one requires.
 
+  
+
+https://github.com/user-attachments/assets/b55c8afd-3991-450d-911b-aa0f4759562e
+
+
+
 When either happens, everyone who owns the reacting character (plus the GM)
 gets a whispered chat card:
 
