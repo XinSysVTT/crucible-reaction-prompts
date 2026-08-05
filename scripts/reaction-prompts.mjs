@@ -480,7 +480,16 @@ async function interceptMove(document, move, options, crossingIndex) {
     explicit: wp.explicit, checkpoint: wp.checkpoint});
   const upTo = move.passed.waypoints.slice(0, crossingIndex + 1).map(toWaypointInput);
   const remaining = move.passed.waypoints.slice(crossingIndex + 1).map(toWaypointInput);
-  const carryOptions = {animation: options.animation, autoRotate: move.autoRotate, showRuler: move.showRuler};
+  // Carry the ENTIRE original options object forward, not just animation/autoRotate/showRuler. The prior
+  // version dropped everything else (constrainOptions, terrainOptions, measureOptions, pathfinding, method,
+  // etc.) when re-issuing the remainder as a brand new movement operation - Foundry then had to fall back to
+  // its own defaults for whatever wasn't explicitly passed, which could legitimately re-derive a DIFFERENT
+  // path for the second half of a drag than the one the player actually planned and saw previewed (e.g.
+  // pathfinding re-running from the paused square with default constraints instead of whatever the player
+  // had configured). That's the "paths look weird after a pause" symptom. autoRotate/showRuler still come
+  // from `move` specifically since those reflect the resolved state of THIS movement, not necessarily what
+  // was in the raw options the hook received.
+  const carryOptions = {...options, autoRotate: move.autoRotate, showRuler: move.showRuler};
 
   log(document.name, `intercepting move: truncating to waypoint ${crossingIndex}`,
     `(${upTo.length} waypoint(s) landing now, ${remaining.length} held back)`);
@@ -510,9 +519,29 @@ async function interceptMove(document, move, options, crossingIndex) {
     replayingMovement.delete(document.id);
     resolveMoveSettled();
   }
-  log(document.name, "truncated leg landed, completed:", completed, "- now at", document.x, document.y,
+
+  // IMPORTANT: do NOT gate on `completed` alone. TokenDocument#move()'s resolved boolean has been
+  // observed to read false for planned movement that landed just fine - see foundryvtt/foundryvtt#13947
+  // ("TokenDocument#move always returns false for planned movement"), fixed upstream in release 14.357.
+  // On any Foundry build older than that, trusting `completed` here means the very first truncated leg
+  // of EVERY intercepted move gets misreported as failed, and every remaining waypoint is silently
+  // dropped - which is indistinguishable, from the table's perspective, from "movement just stops."
+  // The only thing that actually tells us whether the leg landed is the document's own position, so
+  // compare that against where this leg was supposed to end up instead.
+  const finalWaypoint = upTo[upTo.length - 1];
+  const landedAtTarget = !finalWaypoint || ((document.x === finalWaypoint.x) && (document.y === finalWaypoint.y)
+    && ((finalWaypoint.elevation ?? document.elevation ?? 0) === (document.elevation ?? 0)));
+  log(document.name, "truncated leg settled - move() completed flag:", completed, "landed at intended square:",
+    landedAtTarget, "- now at", document.x, document.y,
     `(${Math.round(performance.now() - legStart)}ms elapsed - if this is ~0ms, the leg teleported instead of animating)`);
-  if (!completed || !remaining.length) return;
+  if (!landedAtTarget) {
+    console.warn(`${MODULE_ID} | ${document.name}'s truncated leg did not land at its intended square - `
+      + `abandoning the remaining ${remaining.length} waypoint(s) rather than risk resuming from a wrong `
+      + `position. If this keeps happening, check that your Foundry version is at least 14.357 (see `
+      + `foundryvtt/foundryvtt#13947).`);
+    return;
+  }
+  if (!remaining.length) return;
 
   log(document.name, "holding remaining movement, waiting on reaction window...");
   const waitStart = performance.now();
