@@ -489,7 +489,17 @@ async function interceptMove(document, move, options, crossingIndex) {
   // had configured). That's the "paths look weird after a pause" symptom. autoRotate/showRuler still come
   // from `move` specifically since those reflect the resolved state of THIS movement, not necessarily what
   // was in the raw options the hook received.
-  const carryOptions = {...options, autoRotate: move.autoRotate, showRuler: move.showRuler};
+  // Whitelist only the real movement-option fields - NOT a spread of the raw `options` operation object.
+  // `options` is Foundry's shared, mutable per-operation bookkeeping object (it carries an internal
+  // `_movement` map that Foundry populates via a non-configurable Object.defineProperty per token id).
+  // carryOptions is reused for TWO separate document.move() calls below (upTo, then remaining). Spreading
+  // `options` wholesale leaks that same `_movement` object reference into both calls; the first move()
+  // defines the non-configurable per-token property, and the second move() then throws trying to redefine
+  // it on the same shared object - silently aborting the resumed leg. Only forward the documented,
+  // stateless movement-option fields, which is all we actually need to preserve path/constraint fidelity.
+  const {method, split, planned, constrainOptions, terrainOptions, measureOptions, animation} = options;
+  const carryOptions = {method, split, planned, constrainOptions, terrainOptions, measureOptions, animation,
+    autoRotate: move.autoRotate, showRuler: move.showRuler};
 
   log(document.name, `intercepting move: truncating to waypoint ${crossingIndex}`,
     `(${upTo.length} waypoint(s) landing now, ${remaining.length} held back)`);
