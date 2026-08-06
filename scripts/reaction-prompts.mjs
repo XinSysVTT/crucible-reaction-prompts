@@ -534,7 +534,11 @@ async function interceptMove(document, move, options, crossingIndex) {
   log(document.name, "truncated leg settled - move() completed flag:", completed, "landed at intended square:",
     landedAtTarget, "- now at", document.x, document.y,
     `(${Math.round(performance.now() - legStart)}ms elapsed - if this is ~0ms, the leg teleported instead of animating)`);
-  if (!landedAtTarget) {
+  // Trust either signal, not landedAtTarget alone: the position check is a reasonable proxy but not
+  // bulletproof (grid rounding, hex offsets, elevation edge cases), so requiring it exclusively risks
+  // reintroducing the exact "movement stops" symptom this was meant to fix, just from a different cause.
+  // Only bail if BOTH say the leg didn't land where it should have.
+  if (!completed && !landedAtTarget) {
     console.warn(`${MODULE_ID} | ${document.name}'s truncated leg did not land at its intended square - `
       + `abandoning the remaining ${remaining.length} waypoint(s) rather than risk resuming from a wrong `
       + `position. If this keeps happening, check that your Foundry version is at least 14.357 (see `
