@@ -2,7 +2,7 @@
   "id": "crucible-reaction-prompts",
   "title": "Crucible Reaction Prompts",
   "description": "Watches combat for moments when a character could use a reaction (e.g. Reactive Strike when an enemy leaves engagement, Counterspell when an enemy casts a spell, or Counter-Riposte/Counter-Strike/Counter-Evade/Defensive Roll/Repercussive Block right after a successful melee defense) and posts a chat card to that character's owner(s) and the GM with a one-click 'Use it?' button. Built to be extended: register additional actions against the same triggers, or add new trigger types, via game.modules.get('crucible-reaction-prompts').api.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "compatibility": {
     "minimum": 14,
     "verified": 14
@@ -31,5 +31,5 @@
   ],
   "url": "https://github.com/XinSysVTT/crucible-reaction-prompts",
   "manifest": "https://github.com/XinSysVTT/crucible-reaction-prompts/releases/latest/download/module.json",
-  "download": "https://github.com/XinSysVTT/crucible-reaction-prompts/releases/download/0.0.1/module.zip"
+  "download": "https://github.com/XinSysVTT/crucible-reaction-prompts/releases/download/0.0.2/module.zip"
 }
