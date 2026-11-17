@@ -54,51 +54,57 @@ function log(...args) {
  * @type {Map<string, string>}
  */
 const ACTION_TRIGGERS = new Map([
-  ["reactiveStrike", "engagementLeft"],
-  ["counterspell", "spellCast"],
+  ["reactiveStrike", new Set(["engagementLeft", "spellCast"])],
+  ["counterspell", new Set(["spellCast"])],
   // Talent-granted retaliation actions that require the actor to have just defended against a melee
   // attack with a specific result (see _canUsePostDefend in Crucible's own module/hooks/action.mjs).
   // Each one's own canUse hook already enforces which specific result (Dodge/Parry/Block) it needs, so
   // registering all five against the same trigger type is enough - evaluateActorReactions() lets each
   // action's real _canUse() sort out which of them, if any, actually applies.
-  ["counterEvade", "meleeDefense"],     // Requires a Dodge
-  ["counterRiposte", "meleeDefense"],   // Requires a Parry
-  ["counterStrike", "meleeDefense"],    // Requires a Block
-  ["defensiveRoll", "meleeDefense"],    // Requires a Dodge
-  ["repercussiveBlock", "meleeDefense"], // Requires a Block, and the attack not yet confirmed
-  ["bodyBlock", "meleeDefense"],        // Requires a Glance or Armor result, and the attack not yet confirmed
+  ["counterEvade", new Set(["meleeDefense"])],     // Requires a Dodge
+  ["counterRiposte", new Set(["meleeDefense"])],   // Requires a Parry
+  ["counterStrike", new Set(["meleeDefense"])],    // Requires a Block
+  ["defensiveRoll", new Set(["meleeDefense"])],    // Requires a Dodge
+  ["repercussiveBlock", new Set(["meleeDefense"])], // Requires a Block, and the attack not yet confirmed
+  ["bodyBlock", new Set(["meleeDefense"])],        // Requires a Glance or Armor result, and the attack not yet confirmed
 
   // A Guardian-style talent: react to an ally being hit by a strike (melee or ranged) by taking the hit
   // in their place. See HOOKS.interpose in module/hooks/action.mjs.
-  ["interpose", "allyStruck"],
+  ["interpose", new Set(["allyStruck"])],
 
   // A follow-up strike usable immediately after you land a killing blow in melee on your own turn - not
   // an interrupt of someone else's turn, but still exactly the kind of "hey, you can do this now" moment
   // this module exists for. See HOOKS.ruthlessMomentum in module/hooks/action.mjs.
-  ["ruthlessMomentum", "meleeKill"],
+  ["ruthlessMomentum", new Set(["meleeKill"])],
 
   // A Guardian-style talent, the mirror image of Reactive Strike: react to an enemy moving INTO your
   // engagement radius rather than out of it. Has no canUse hook of its own in Crucible - it relies
   // entirely on the generic "reaction" tag gate - so this trigger type is the whole story.
-  ["intercept", "engagementEntered"],
+  ["intercept", new Set(["engagementEntered"])],
 
   // Registered against the same trigger as Counterspell, since its condition is also "an enemy you can
   // see casts a spell". Interrupting Throw's talent text additionally requires the spell to have cost 3+
   // Action - Crucible has no canUse hook enforcing that (no HOOKS.interruptingThrow exists), so this
   // module enforces it itself via EXTRA_REQUIREMENTS below rather than relying on the real action.use()
   // to catch it.
-  ["interruptingThrow", "spellCast"],
+  ["interruptingThrow", new Set(["spellCast"])],
 
   // React to any enemy action - spell, strike, whatever - that targets someone other than the caster
   // themselves, once per round (Crucible's own HOOKS.coveringFire enforces the once-per-round part; this
   // module just needs to notice the moment). Broader than the existing spellCast/meleeDefense triggers,
   // so it gets its own detector (checkEnemyTargetsOther) rather than reusing one of them.
-  ["coveringFire", "enemyActsAgainstOther"],
+  ["coveringFire", new Set(["enemyActsAgainstOther"])],
 
   // Adversary-only talent "Sacrifice Self" (packs/adversary-talents): the mirror of Interpose for
   // monsters - take a hit meant for a nearby ally, destroying itself in the process. Same trigger as
   // interpose since the moment that matters ("an ally is about to be struck") is identical.
-  ["sacrificeSelf", "allyStruck"]
+  ["sacrificeSelf", new Set(["allyStruck"])],
+
+  // Added in Crucible 0.11.0:
+  // - Gallows Humor (pre2c): 1-Action reaction to an ally's Critical Failure, restoring Morale.
+  // - Spellcatch (pre4b): Reaction when targeted by a Spell to catch it on your Talisman.
+  ["gallowsHumor", new Set(["allyCritFail"])],
+  ["spellcatch", new Set(["spellTargeted"])]
 ]);
 
 /**
@@ -111,7 +117,12 @@ function registerActionTrigger(actionId, triggerType) {
     throw new Error(`${MODULE_ID} | Unknown trigger type "${triggerType}". `
       + `Known types: ${[...TRIGGER_TYPES.keys()].join(", ")}`);
   }
-  ACTION_TRIGGERS.set(actionId, triggerType);
+  let triggers = ACTION_TRIGGERS.get(actionId);
+  if (!triggers) {
+    triggers = new Set();
+    ACTION_TRIGGERS.set(actionId, triggers);
+  }
+  triggers.add(triggerType);
 }
 
 /**
@@ -127,7 +138,10 @@ const EXTRA_REQUIREMENTS = new Map([
   // Interrupting Throw's talent text: "An enemy you can see casts a Spell which costs 3 Action or
   // greater." Falls back to allowing the prompt if cost data can't be read for some reason - fail open,
   // same philosophy as isTargetInRange().
-  ["interruptingThrow", sourceAction => (sourceAction?.cost?.action ?? 3) >= 3]
+  ["interruptingThrow", sourceAction => (sourceAction?.cost?.action ?? 3) >= 3],
+  // Inquisitor (HOOKS.inquisitor000000 in module/hooks/talent.mjs) allows Reactive Strike to be used
+  // in reaction to an enemy casting a spell, in addition to the normal engagement-left trigger.
+  ["reactiveStrike:spellCast", (_sourceAction, actor) => actor?.talentIds?.has("inquisitor000000") ?? false]
 ]);
 
 /**
@@ -148,8 +162,10 @@ function registerExtraRequirement(actionId, guard) {
 const TRIGGER_TYPES = new Map([
   ["engagementLeft", {label: "an enemy leaves engagement"}],
   ["spellCast", {label: "an enemy casts a spell"}],
+  ["spellTargeted", {label: "an enemy targets you with a spell"}],
   ["meleeDefense", {label: "you just defended against a melee attack"}],
   ["allyStruck", {label: "an ally is struck by an attack"}],
+  ["allyCritFail", {label: "an ally suffers a critical failure"}],
   ["meleeKill", {label: "you land a killing blow in melee"}],
   ["engagementEntered", {label: "an enemy enters your engagement"}],
   ["enemyActsAgainstOther", {label: "an enemy acts against someone else"}]
@@ -332,6 +348,7 @@ Hooks.on("preMoveToken", (document, move, options) => {
     log(document.name, "preMoveToken: skipping - no combat is active");
     return true;
   }
+  if (!canvas.scene?.useMicrogrid) return true; // Crucible only computes engagement on microgrid scenes.
   if (!document.actor || (document.actor.type === "group")) {
     log(document.name, "preMoveToken: skipping - no actor, or a group actor");
     return true;
@@ -386,27 +403,18 @@ function findEarliestReactionCrossing(document, move) {
       log(document.name, "crossing-scan: skipping", reactorToken.actor?.name, "- not hostile to mover");
       continue;
     }
-    for (const [actionId, trigger] of ACTION_TRIGGERS) {
-      if ((trigger !== "engagementLeft") && (trigger !== "engagementEntered")) continue;
+    for (const [actionId, triggers] of ACTION_TRIGGERS) {
+      if (!triggers.has("engagementLeft") && !triggers.has("engagementEntered")) continue;
       const action = reactorToken.actor.actions?.[actionId];
       if (!action) {
         log(document.name, "crossing-scan: skipping", reactorToken.actor?.name, actionId, "- actor has no such action");
         continue;
       }
-      // engagementLeft/engagementEntered are keyed off the reactor's live engagement radius
-      // (actor.system.movement.engagement = baseEngagement + per-weapon "engaging" bonus - see
-      // actor-base.mjs), NOT the action's own range.minimum/maximum. reactiveStrike/intercept both
-      // declare range:{weapon:true}, which resolves to the equipped weapon's attack reach - a distinct,
-      // unrelated stat (e.g. a reach polearm can have attack range 3 while engagement is still 1). Using
-      // action.range here was why the scan never saw a crossing: it kept treating the mover as "in range"
-      // out to the weapon's reach, well past the point where the real engagement-radius check (used by
-      // checkEngagementLeft) had already flipped.
-      const engagement = reactorToken.actor.system.movement?.engagement;
-      if (!engagement) {
-        log(document.name, "crossing-scan: skipping", reactorToken.actor?.name, actionId,
-          "- actor has no engagement radius", engagement);
-        continue;
-      }
+      // Crucible's engagement area (CrucibleTokenObject#getEngagementRectangle(distance=1)) is always a
+      // 1-grid-unit radius around the token, NOT actor.system.movement.engagement (which is flanking
+      // capacity - the number of enemies that can engage you before you're flanked - and increases with
+      // "engaging" weapons). Treating that capacity as a distance would falsely intercept 2-3 squares out.
+      const engagement = 1;
       // _canUse() takes no target/position argument - it's purely the reactor's own resource/state gate
       // (Action Points, the "reaction" tag's turn-state checks, etc.), same call evaluateActorReactions
       // makes before its own isTargetInRange check. Filtering on it here avoids splitting and pausing the
@@ -711,13 +719,18 @@ Hooks.on("createChatMessage", message => {
   log("reconstructed action", action.id, "tags:", [...(action.tags ?? [])], "for actor", actingToken.actor?.name);
 
   const wasSpell = action.tags?.has("composed") || action.tags?.has("iconicSpell");
-  if (wasSpell) checkSpellCast(action, actingToken);
+  if (wasSpell) {
+    checkSpellCast(action, actingToken);
+    checkSpellTargeted(action, actingToken);
+  }
 
   const wasMeleeAttack = action.tags?.has("melee");
   if (wasMeleeAttack) checkMeleeDefense(action, actingToken);
 
   const wasStrike = action.tags?.has("strike");
   if (wasStrike) checkAllyStruck(action, actingToken);
+
+  checkAllyCritFail(action, actingToken);
 
   // Unlike the checks above, Covering Fire's condition isn't limited to a particular action tag - any
   // action at all that targets someone other than its own actor qualifies - so this one always runs.
@@ -776,6 +789,38 @@ function checkSpellCast(action, casterToken) {
       continue;
     }
     evaluateActorReactions(reactorToken, "spellCast", casterToken, action);
+  }
+}
+
+/**
+ * Any hostile target of a spell is a plausible Spellcatch reactor.
+ * @param {CrucibleAction} action
+ * @param {Token} casterToken
+ */
+function checkSpellTargeted(action, casterToken) {
+  for (const [targetActor, targetData] of action.targets ?? []) {
+    if (targetActor === action.actor) continue;
+    const reactorToken = targetData?.token?.object ?? targetActor.getActiveTokens()[0];
+    if (!reactorToken?.actor) continue;
+    if (!areEnemies(reactorToken, casterToken)) continue;
+    evaluateActorReactions(reactorToken, "spellTargeted", casterToken, action);
+  }
+}
+
+/**
+ * Any ally of an actor who just rolled a Critical Failure is a plausible Gallows Humor reactor.
+ * @param {CrucibleAction} action
+ * @param {Token} actingToken
+ */
+function checkAllyCritFail(action, actingToken) {
+  const hasCritFail = action.events?.some(e => e.roll?.isCriticalFailure);
+  if (!hasCritFail) return;
+
+  for (const combatant of game.combat?.combatants ?? []) {
+    const allyToken = combatant.token?.object;
+    if (!allyToken?.actor || (allyToken === actingToken)) continue;
+    if (!areAllies(allyToken, actingToken)) continue;
+    evaluateActorReactions(allyToken, "allyCritFail", actingToken, action);
   }
 }
 
@@ -886,14 +931,14 @@ async function evaluateActorReactions(reactorToken, triggerType, targetToken, so
   const actor = reactorToken.actor;
   if (!actor) return;
 
-  for (const [actionId, registeredTrigger] of ACTION_TRIGGERS) {
-    if (registeredTrigger !== triggerType) continue;
+  for (const [actionId, triggers] of ACTION_TRIGGERS) {
+    if (!triggers.has(triggerType)) continue;
 
     const action = actor.actions?.[actionId];
     if (!action) continue; // This actor doesn't have that action at all - not worth logging, most won't.
 
-    const extraGuard = EXTRA_REQUIREMENTS.get(actionId);
-    if (extraGuard && !extraGuard(sourceAction)) {
+    const extraGuard = EXTRA_REQUIREMENTS.get(`${actionId}:${triggerType}`) ?? EXTRA_REQUIREMENTS.get(actionId);
+    if (extraGuard && !extraGuard(sourceAction, actor)) {
       log(actor.name, actionId, "skipped - fails an extra requirement Crucible itself doesn't enforce");
       continue;
     }
@@ -983,30 +1028,40 @@ function isTargetInRange(action, reactorToken, targetToken) {
 }
 
 /**
- * Are two tokens on hostile dispositions to one another?
+ * Resolve Crucible's disposition groups for a token's disposition, matching CrucibleActor.getDispositionGroups.
+ * @param {number} disposition
+ * @returns {{ally: number[], enemy: number[]}}
+ */
+function getDispositionGroups(disposition) {
+  const fn = crucible.api?.documents?.CrucibleActor?.getDispositionGroups;
+  if (typeof fn === "function") return fn(disposition);
+  const D = CONST.TOKEN_DISPOSITIONS;
+  switch (disposition) {
+    case D.HOSTILE: return {ally: [D.HOSTILE], enemy: [D.NEUTRAL, D.FRIENDLY]};
+    case D.NEUTRAL:
+    case D.FRIENDLY: return {ally: [D.NEUTRAL, D.FRIENDLY], enemy: [D.HOSTILE]};
+    default: return {ally: [], enemy: []};
+  }
+}
+
+/**
+ * Are two tokens on hostile dispositions to one another according to Crucible's rules?
  * @param {Token} a
  * @param {Token} b
  * @returns {boolean}
  */
 function areEnemies(a, b) {
-  const da = a.document.disposition, db = b.document.disposition;
-  const HOSTILE = CONST.TOKEN_DISPOSITIONS.HOSTILE, FRIENDLY = CONST.TOKEN_DISPOSITIONS.FRIENDLY;
-  if ((da === HOSTILE) && (db !== HOSTILE)) return true;
-  if ((db === HOSTILE) && (da !== HOSTILE)) return true;
-  return false;
+  return getDispositionGroups(a.document.disposition).enemy.includes(b.document.disposition);
 }
 
 /**
- * Are two tokens on the same (non-neutral) disposition, i.e. plausible allies for something like
- * Interpose? Deliberately stricter than "not enemies" - a Neutral token isn't really anyone's ally.
+ * Are two tokens on allied dispositions according to Crucible's rules?
  * @param {Token} a
  * @param {Token} b
  * @returns {boolean}
  */
 function areAllies(a, b) {
-  const da = a.document.disposition, db = b.document.disposition;
-  const {HOSTILE, FRIENDLY} = CONST.TOKEN_DISPOSITIONS;
-  return ((da === FRIENDLY) && (db === FRIENDLY)) || ((da === HOSTILE) && (db === HOSTILE));
+  return getDispositionGroups(a.document.disposition).ally.includes(b.document.disposition);
 }
 
 /**
